@@ -1,0 +1,13 @@
+{
+  "key": "kernelalloc",
+  "name": "Boost.KernelAlloc",
+  "authors": [ "Niall Douglas" ],
+  "maintainers": [ "Niall Douglas" ],
+  "description": "A kernel memory allocator.",
+  "std": [ "11" ],
+  "category": [
+    "Domain Specific",
+    "IO",
+    "System"
+  ]
+}
