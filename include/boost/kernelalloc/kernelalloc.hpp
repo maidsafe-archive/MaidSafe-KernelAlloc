@@ -49,7 +49,13 @@ class source;
 typedef std::shared_ptr<source> source_ptr;
 
 /*! \class allocation
- * \brief An allocation of memory in the kernel
+ * \brief An allocation of memory in the kernel.
+ * 
+ * Note that the contents of an allocation are \b not necessarily discarded \b nor destroyed
+ * on destruction. Instead the storage used by the allocation is recycled and made available
+ * for subsequent allocations. Therefore if the allocation is particularly large, you might
+ * consider setting the discard_on_free flag which will release any RAM resources on free or
+ * even the destroy_on_free flag which will release all storage on free.
  */
 class BOOST_KERNELALLOC_DECL allocation : public std::enable_shared_from_this<allocation>
 {
@@ -86,7 +92,7 @@ public:
   size_type size() const BOOST_NOEXCEPT { return _size; }
   
   /*! \name allocation_map
-   * \brief Maps part of the allocation into the calling process
+   * \brief Maps part of the allocation into the calling process. \em offset and \em length need to be valid.
    */
   //@{
   virtual size_type map(map_t *m, size_type no) BOOST_NOEXCEPT=0;
@@ -121,7 +127,7 @@ public:
   
   
   /*! \name allocation_map_prefault
-   * \brief Maps and prefaults for reading part of the allocation into the calling process
+   * \brief Maps and prefaults for reading part of the allocation into the calling process. \em offset and \em length need to be valid.
    * 
    * Normally when you allocate memory from the kernel each page is marked to page fault on first read or
    * write, so if working with N pages you see N page faults per read and potentially another N page faults per write,
@@ -163,7 +169,7 @@ public:
   
   
   /*! \name allocation_unmap
-   * \brief Unmaps part of the allocation from the calling process
+   * \brief Unmaps part of the allocation from the calling process. Requires \em addr to point to a valid map and \em length to be valid.
    */
   //@{
   virtual size_type unmap(map_t *m, size_type no) BOOST_NOEXCEPT=0;
@@ -190,13 +196,15 @@ public:
   //@}
   
   /*! \name allocation_discard
-   * \brief Discards without saving any dirty pages in the map and decommits any RAM caching used by the map.
+   * \brief Discards without saving any RAM resources associated with an existing map.
+   * Requires \em addr to point to a valid map and \em length need to be valid.
+   * 
    * This essentially returns a map to a state of being freshly just mapped in terms of use of kernel resources.
    * Note that the kernel is free to ignore or partially ignore this request, and may in fact incompletely
    * decommit storage such that the discarded pages become a mix of zeroed and non-zeroed pages.
    * 
    * If you routinely allocate buffers, use them and deallocate them, this is *exactly* the correct alternative.
-   * Instead of deallocation, discard their contents instead and reuse the allocation.
+   * Instead of deallocation-reallocation, discard their contents instead and reuse the allocation.
    */
   //@{
   virtual size_type discard(map_t *m, size_type no) BOOST_NOEXCEPT=0;
@@ -221,6 +229,39 @@ public:
     return discard(c.data(), c.size());
   }
   //@}
+
+  /*! \name allocation_destroy
+   * \brief Destroys the contents of the allocation between \em offset and \em length, releasing all storage
+   * associated with that region.
+   * 
+   * Despite that the kernel is free to ignore or partially ignore this request, you are guaranteed that the region
+   * specified will have its contents reset to zero. In practice, the storage backing the region will only
+   * be freed if and when the kernel decides, which may be never in some situations.
+   */
+  //@{
+  virtual size_type destroy(map_t *m, size_type no) BOOST_NOEXCEPT=0;
+  //! \brief Optimisation for a single map_t
+  bool destroy(map_t &m) BOOST_NOEXCEPT { return 1==destroy(&m, 1); }
+  //! \brief For a range of dereferenceable pointers or iterators
+  template<class T, typename=typename detail::is_rangeable<T>::type> size_type destroy(T &&begin, T &&end)
+  {
+    size_type ret=0;
+    for(; begin!=end; ++begin)
+      ret+=destroy(&(*begin()), 1);
+    return ret;
+  }
+  //! \brief For a container
+  template<class T, typename=typename detail::is_container<T>::type> size_type destroy(T &&cont)
+  {
+    return destroy(std::begin(std::forward<T>(cont)), std::end(std::forward<T>(cont)));
+  }
+  //! \brief Optimisation for a vector
+  size_type destroy(const std::vector<map_t> &c)
+  {
+    return destroy(c.data(), c.size());
+  }
+  //@}
+
 };
 
 /*! \class source
@@ -240,11 +281,21 @@ public:
   typedef const pointer const_pointer;
   //! \brief A size_t
   typedef size_t size_type;
+
+  //! \brief Flags for this source
+  enum class flags_t
+  {
+    normal=0,                   //!< No special behaviour
+    discard_on_free=1,          //!< Issue a discard() when an allocation is about to be freed
+    destroy_on_free=2,          //!< Issue a destroy() when an allocation is about to be freed
+    top_down=(1<<16),           //!< Allocate from the top of memory going downwards (e.g. stacks)
+    large_pages=(1<<17)         //!< Use large TLB entries where possible.
+  };
 protected:
   bool _using_remaining;
   size_type _maximum;
   atomic<size_type> _allocated, _remaining;
-  source(size_type maximum, size_type remaining) : _using_remaining((remaining!=(size_type)-1)), _maximum(maximum), _remaining(remaining) { }
+  source(flags_t flags, size_type maximum, size_type remaining) : _using_remaining((remaining!=(size_type)-1)), _maximum(maximum), _remaining(remaining) { }
   
   void _register_map(allocation *a, allocation::map_t &map);
   void _register_unmap(allocation *a, allocation::map_t &map);
@@ -262,13 +313,13 @@ public:
   //! \brief The name of this source, suitable for printing etc.
   virtual const char *name() BOOST_NOEXCEPT=0;
   
-  /*! \brief Allocates at least \em bytes from the source, returning an empty pointer if unsuccessful
+  /*! \brief Allocates at least \em bytes from the source.
    */
-  virtual pointer allocate(error_code &ec, size_type bytes) BOOST_NOEXCEPT=0;
+  virtual expected<pointer, error_code> allocate(size_type bytes) BOOST_NOEXCEPT=0;
   
   /*! \brief Returns the allocation associated with mapped address \em addr
    */
-  pointer allocation(void *addr, allocation::map_t *map=nullptr) BOOST_NOEXCEPT;
+  std::pair<pointer, allocation::map_t> map_to_pointer(void *addr) BOOST_NOEXCEPT;
 };
 
 /*! \class allocator
@@ -304,10 +355,9 @@ public:
   {
     if(!_source) throw std::invalid_argument("Unset source");
     if(n>max_size()) throw std::bad_alloc();
-    error_code ec;
     size_type bytes=n*sizeof(T);
-    auto a(_source->allocate(ec, bytes));
-    if(ec || !a) throw std::system_error(ec);
+    auto a(_source->allocate(bytes));
+    if(!a) throw std::system_error(a.error());
     // Probably he's just about to construct into this now, so prefault as a batch
     auto m(a->map_prefault());
     if(!m->addr) throw std::bad_alloc();
@@ -337,6 +387,8 @@ template<class A, class B> inline bool operator!=(const allocator<A> &a, const a
  *  - Only the map of offset zero to length will succeed.
  *  - Attempts to duplicate the map will return the existing map.
  *  - Contents are destroyed as soon as unmap is called.
+ *  - Destroy is implemented as discard followed by a scan for non-zero bytes, and where found
+ *    the non-zero page is zeroed.
  */
 class BOOST_KERNELALLOC_DECL nonpersistent_allocation : public allocation
 {
@@ -349,6 +401,7 @@ public:
   virtual size_type map_prefault(map_t *m, size_type no) BOOST_NOEXCEPT override final;
   virtual size_type unmap(map_t *m, size_type no) BOOST_NOEXCEPT override final;
   virtual size_type discard(map_t *m, size_type no) BOOST_NOEXCEPT override final;
+  virtual size_type destroy(map_t *m, size_type no) BOOST_NOEXCEPT override final;
 };
 
 /*! \class nonpersistent_source
@@ -361,16 +414,207 @@ public:
   typedef rebind_pointer<nonpersistent_allocation> pointer;
   //! \brief A const pointer to an allocation
   typedef const pointer const_pointer;
-
+  
   //! \brief Constructs a source of non persistent kernel memory.
-  nonpersistent_source(size_type maximum=(size_type)-1, size_type remaining=(size_type)-1) : source(maximum, remaining) { }
+  nonpersistent_source(flags_t flags=flags_t::normal, size_type maximum=(size_type)-1, size_type remaining=(size_type)-1) : source(flags, maximum, remaining) { }
   
   //! \brief The name of this source, suitable for printing etc.
   virtual const char *name() BOOST_NOEXCEPT override final { return "non-persistent"; }
   
+  /*! \brief Allocates at least \em bytes from the source.
+   */
+  virtual expected<pointer, error_code> allocate(size_type bytes) BOOST_NOEXCEPT override final;
+};
+
+
+/*! \class opencl_allocation
+ * \brief A non persistent allocation of memory in the graphics card.
+ * 
+ * This is very similar to nonpersistent_allocation with the same limitations.
+ */
+class BOOST_KERNELALLOC_DECL opencl_allocation : public allocation
+{
+protected:
+  opencl_allocation(opencl_source *p, size_type bytes);
+public:
+  virtual ~opencl_allocation() override final;
+  
+  virtual size_type map(map_t *m, size_type no) BOOST_NOEXCEPT override final;
+  virtual size_type map_prefault(map_t *m, size_type no) BOOST_NOEXCEPT override final;
+  virtual size_type unmap(map_t *m, size_type no) BOOST_NOEXCEPT override final;
+  virtual size_type discard(map_t *m, size_type no) BOOST_NOEXCEPT override final;
+  virtual size_type destroy(map_t *m, size_type no) BOOST_NOEXCEPT override final;
+};
+
+/*! \class opencl_source
+ * \brief A non-persistent source of kernel memory in the graphics card.
+ */
+class BOOST_KERNELALLOC_DECL opencl_source : public source
+{
+public:
+  //! \brief A pointer to an allocation
+  typedef rebind_pointer<opencl_allocation> pointer;
+  //! \brief A const pointer to an allocation
+  typedef const pointer const_pointer;
+  
+  //! \brief Constructs a source of non persistent kernel memory.
+  opencl_source(flags_t flags=flags_t::normal, size_type maximum=(size_type)-1, size_type remaining=(size_type)-1) : source(flags, maximum, remaining) { }
+  
+  //! \brief The name of this source, suitable for printing etc.
+  virtual const char *name() BOOST_NOEXCEPT override final { return "opencl"; }
+  
+  /*! \brief Allocates at least \em bytes from the source.
+   */
+  virtual expected<pointer, error_code> allocate(size_type bytes) BOOST_NOEXCEPT override final;
+};
+
+
+/*! \class persistent_allocation
+ * \brief An allocation of persistent memory in the kernel, usually the temporary file system cache.
+ * 
+ * Unlike non persistent allocations, storage for persistent allocations is kept in the
+ * temporary file system cache or equivalent. It therefore can persist until the next reboot
+ * of the machine, and it offers the following features:
+ *  - Maps of any part of the allocation into user space can be made, including duplicate maps and
+ *    discontinuous maps.
+ *  - Contents survive no maps existing, though remember to keep a shared_ptr open to the allocation
+ *    if you wish its contents to be retained.
+ *  - Persistent allocation sources can be named, and that name also used by other processes to see the same
+ *    allocation. Simply ask the same named source for the allocation with the given unique id.
+ *  - Lets 32 bit processes use a lot more RAM than 4Gb. One must simply take care to not leave
+ *    allocations mapped into memory lying around.
+ */
+class BOOST_KERNELALLOC_DECL persistent_allocation : public allocation
+{
+public:
+  //! \brief The type of a unique allocation id
+  typedef unsigned long long unique_id_t;
+protected:
+  unique_id_t _unique_id;
+  persistent_allocation(nonpersistent_source *p, size_type bytes);
+public:
+  virtual ~persistent_allocation() override final;
+  
+  virtual size_type map(map_t *m, size_type no) BOOST_NOEXCEPT override final;
+  virtual size_type map_prefault(map_t *m, size_type no) BOOST_NOEXCEPT override final;
+  virtual size_type unmap(map_t *m, size_type no) BOOST_NOEXCEPT override final;
+  virtual size_type discard(map_t *m, size_type no) BOOST_NOEXCEPT override final;
+  virtual size_type destroy(map_t *m, size_type no) BOOST_NOEXCEPT override final;
+    
+  //! \brief The unique id of this persistent allocation within its source.
+  unique_id_t unique_id() const BOOST_NOEXCEPT { return _unique_id; }
+
+  //! \brief Resizes the allocation to a new size
+  error_code resize(size_type newsize) BOOST_NOEXCEPT;
+};
+
+/*! \class persistent_source
+ * \brief A persistent source of kernel memory, usually the temporary file system cache.
+ */
+class BOOST_KERNELALLOC_DECL persistent_source : public source
+{
+public:
+  //! \brief A pointer to an allocation
+  typedef rebind_pointer<persistent_allocation> pointer;
+  //! \brief A const pointer to an allocation
+  typedef const pointer const_pointer;
+  
+  //! \brief Constructs a source of optionally named persistent kernel memory.
+  persistent_source(path name=path(), flags_t flags=flags_t::normal, size_type maximum=(size_type)-1, size_type remaining=(size_type)-1) : source(maximum, remaining) { }
+  
+  //! \brief The name of this source, suitable for printing etc.
+  virtual const char *name() BOOST_NOEXCEPT override final { return "persistent"; }
+  
   /*! \brief Allocates at least \em bytes from the source, returning an empty pointer if unsuccessful
    */
-  virtual pointer allocate(error_code &ec, size_type bytes) BOOST_NOEXCEPT override final;
+  virtual expected<pointer, error_code> allocate(size_type bytes) BOOST_NOEXCEPT override final;
+
+  /*! \brief Returns the allocation associated with unique id \em id
+   */
+  std::pair<pointer, allocation::map_t> id_to_pointer(persistent_allocation::unique_id_t id) BOOST_NOEXCEPT;
+
+};
+
+
+/*! \class durable_allocation
+ * \brief An allocation of durable memory in the kernel backed by a file on the filing system.
+ * 
+ * Durable allocations are similar to persistent allocations, except that their storage is kept
+ * in a sparse file on the filing system and therefore will "survive" reboots (see below). The
+ * intent of their usage is for very large allocations which would normally be refused to be backed
+ * by the system page file, so if you need to allocate multiple gigabytes of memory far exceeding
+ * available RAM, durable_source is exactly the right thing to use. You should note:
+ * 
+ *  - Dirty pages are kept in memory as much as possible, and only actually flushed to the disk
+ *    when there is insufficient RAM to store their contents anywhere else. By default the
+ *    destroy_on_free flag is set in durable_source, this will throw away any dirty pages instead of
+ *    writing anything out on free and also deallocate any of that allocation which was flushed to
+ *    disk, so ordinarily speaking the backing file consumes a minimal amount of disk space (see below)
+ *    despite declaring itself to be many gigabytes in size. If you want to actually persist an
+ *    allocation into the file, either use discard_on_free combined with calling flush(), or no flag
+ *    to have the kernel lazily write out changes at its discretion on free.
+ * 
+ *  - When available the file is stored sparsely (supported by ext4, NTFS, HFS+, BTRFS), and if without
+ *    sparse file support then with any compressed file support in the filing system (supported by ZFS).
+ *    This means that only the pages flushed to disk due to insufficient RAM actually consume any disk
+ *    space as those same pages are deallocated from the filing system on free. If your filing system
+ *    does not support sparse files, zeroes are written instead which ought to compress very well and
+ *    effectively achieve the same thing as sparse deallocation. Finally, if your filing system supports
+ *    neither sparse files nor compressed files, you should take care to regularly delete the file
+ *    as horrible fragmentation will occur - indeed, deleting the backing file before first use is
+ *    generally always recommended, just be careful of races with any other concurrent users.
+ * 
+ *  - If you do persist allocations, you will need to retain their unique id and size across reboots.
+ */
+class BOOST_KERNELALLOC_DECL persistent_allocation : public allocation
+{
+public:
+  //! \brief The type of a unique allocation id
+  typedef unsigned long long unique_id_t;
+protected:
+  unique_id_t _unique_id;
+  persistent_allocation(nonpersistent_source *p, size_type bytes);
+public:
+  virtual ~persistent_allocation() override final;
+  
+  virtual size_type map(map_t *m, size_type no) BOOST_NOEXCEPT override final;
+  virtual size_type map_prefault(map_t *m, size_type no) BOOST_NOEXCEPT override final;
+  virtual size_type unmap(map_t *m, size_type no) BOOST_NOEXCEPT override final;
+  virtual size_type discard(map_t *m, size_type no) BOOST_NOEXCEPT override final;
+  virtual size_type destroy(map_t *m, size_type no) BOOST_NOEXCEPT override final;
+    
+  //! \brief The unique id of this persistent allocation within its source.
+  unique_id_t unique_id() const BOOST_NOEXCEPT { return _unique_id; }
+
+  //! \brief Resizes the allocation to a new size
+  error_code resize(size_type newsize) BOOST_NOEXCEPT;
+};
+
+/*! \class durable_source
+ * \brief A durable source of kernel memory stored in a file on the filing system.
+ */
+class BOOST_KERNELALLOC_DECL durable_source : public source
+{
+public:
+  //! \brief A pointer to an allocation
+  typedef rebind_pointer<durable_allocation> pointer;
+  //! \brief A const pointer to an allocation
+  typedef const pointer const_pointer;
+  
+  //! \brief Constructs a source of durable kernel memory.
+  persistent_source(path name, flags_t flags=flags_t::normal, size_type maximum=(size_type)-1, size_type remaining=(size_type)-1) : source(maximum, remaining) { }
+  
+  //! \brief The name of this source, suitable for printing etc.
+  virtual const char *name() BOOST_NOEXCEPT override final { return "durable"; }
+  
+  /*! \brief Allocates at least \em bytes from the source, returning an empty pointer if unsuccessful
+   */
+  virtual expected<pointer, error_code> allocate(size_type bytes) BOOST_NOEXCEPT override final;
+
+  /*! \brief Returns the allocation associated with unique id \em id
+   */
+  std::pair<pointer, allocation::map_t> id_to_pointer(persistent_allocation::unique_id_t id, size_type size) BOOST_NOEXCEPT;
+
 };
 
 
