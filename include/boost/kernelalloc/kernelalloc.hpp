@@ -45,19 +45,15 @@ namespace detail
   template<class T, typename = decltype(*std::begin(std::declval<T>()), *std::end(std::declval<T>()), void())> struct is_container { typedef T type; };
 }
 
-class provider;
-typedef std::shared_ptr<provider> provider_ptr;
+class source;
+typedef std::shared_ptr<source> source_ptr;
 
 /*! \class allocation
  * \brief An allocation of memory in the kernel
  */
 class BOOST_KERNELALLOC_DECL allocation : public std::enable_shared_from_this<allocation>
 {
-  provider *_provider;
-  allocation(provider *p) : _provider(p) { }
 public:
-  virtual ~allocation() {}
-  
   //! \brief A pointer to a map
   typedef void *pointer;
   //! \brief A const pointer to an allocation
@@ -74,12 +70,20 @@ public:
     map_t() : addr(nullptr), offset(0), length(0) { }
     map_t(size_type _offset, size_type _length) : addr(nullptr), offset(_offset), length(_length) { }
   };
+private:
+  source *_source;
+protected:
+  size_type _size;
+  allocation(source *p, size_type size) : _source(p), _size(size) { }
+public:
+  virtual ~allocation() {}
+  
 
-  //! \brief The provider for this allocation
-  provider *provider() const BOOST_NOEXCEPT { return _provider; }
+  //! \brief The source for this allocation
+  source *source() const BOOST_NOEXCEPT { return _source; }
   
   //! \brief The size of the allocation
-  virtual size_type size() const BOOST_NOEXCEPT=0;
+  size_type size() const BOOST_NOEXCEPT { return _size; }
   
   /*! \name allocation_map
    * \brief Maps part of the allocation into the calling process
@@ -87,7 +91,7 @@ public:
   //@{
   virtual size_type map(map_t *m, size_type no) BOOST_NOEXCEPT=0;
   //! \brief Optimisation for a single map_t
-  bool map(map_t &m) BOOST_NOEXCEPT { return 1==map(&m 1); }
+  bool map(map_t &m) BOOST_NOEXCEPT { return 1==map(&m, 1); }
   //! \brief For a range of dereferenceable pointers or iterators
   template<class T, typename=typename detail::is_rangeable<T>::type> size_type map(T &&begin, T &&end)
   {
@@ -116,13 +120,55 @@ public:
   //@}
   
   
+  /*! \name allocation_map_prefault
+   * \brief Maps and prefaults for reading part of the allocation into the calling process
+   * 
+   * Normally when you allocate memory from the kernel each page is marked to page fault on first read or
+   * write, so if working with N pages you see N page faults per read and potentially another N page faults per write,
+   * each of which costs 500-5000 CPU cycles. Map and commit asks the kernel to do as much of the \em read
+   * page faulting in the range as possible now. Note that the kernel is free to ignore or partially ignore
+   * this request, and may in fact incompletely prefault pages into memory depending on a wide range of
+   * operating system specific factors.
+   */
+  //@{
+  virtual size_type map_prefault(map_t *m, size_type no) BOOST_NOEXCEPT=0;
+  //! \brief Optimisation for a single map_t
+  bool map_prefault(map_t &m) BOOST_NOEXCEPT { return 1==map_prefault(&m, 1); }
+  //! \brief For a range of dereferenceable pointers or iterators
+  template<class T, typename=typename detail::is_rangeable<T>::type> size_type map_prefault(T &&begin, T &&end)
+  {
+    size_type ret=0;
+    for(; begin!=end; ++begin)
+      ret+=map_prefault(&(*begin()), 1);
+    return ret;
+  }
+  //! \brief For a container
+  template<class T, typename=typename detail::is_container<T>::type> size_type map_prefault(T &&cont)
+  {
+    return map_prefault(std::begin(std::forward<T>(cont)), std::end(std::forward<T>(cont)));
+  }
+  //! \brief Optimisation for a vector
+  size_type map_prefault(const std::vector<map_t> &c)
+  {
+    return map_prefault(c.data(), c.size());
+  }
+  //! \brief Maps all of the allocation into the calling process
+  map_t map_prefault() BOOST_NOEXCEPT
+  {
+    map_t m(0, size());
+    map_prefault(&m, 1);
+    return m;
+  }
+  //@}
+  
+  
   /*! \name allocation_unmap
    * \brief Unmaps part of the allocation from the calling process
    */
   //@{
   virtual size_type unmap(map_t *m, size_type no) BOOST_NOEXCEPT=0;
   //! \brief Optimisation for a single map_t
-  bool unmap(map_t &m) BOOST_NOEXCEPT { return 1==unmap(&m 1); }
+  bool unmap(map_t &m) BOOST_NOEXCEPT { return 1==unmap(&m, 1); }
   //! \brief For a range of dereferenceable pointers or iterators
   template<class T, typename=typename detail::is_rangeable<T>::type> size_type unmap(T &&begin, T &&end)
   {
@@ -143,42 +189,19 @@ public:
   }
   //@}
   
-  /*! \name allocation_prefault
-   * \brief Prefaults preexisting maps into the calling process in a single shot instead of page by page.
-   * addr must point to a valid existing map or an error will occur.
-   */
-  //@{
-  virtual size_type prefault(map_t *m, size_type no) BOOST_NOEXCEPT=0;
-  //! \brief Optimisation for a single map_t
-  bool prefault(map_t &m) BOOST_NOEXCEPT { return 1==prefault(&m 1); }
-  //! \brief For a range of dereferenceable pointers or iterators
-  template<class T, typename=typename detail::is_rangeable<T>::type> size_type prefault(T &&begin, T &&end)
-  {
-    size_type ret=0;
-    for(; begin!=end; ++begin)
-      ret+=prefault(&(*begin()), 1);
-    return ret;
-  }
-  //! \brief For a container
-  template<class T, typename=typename detail::is_container<T>::type> size_type prefault(T &&cont)
-  {
-    return prefault(std::begin(std::forward<T>(cont)), std::end(std::forward<T>(cont)));
-  }
-  //! \brief Optimisation for a vector
-  size_type prefault(const std::vector<map_t> &c)
-  {
-    return prefault(c.data(), c.size());
-  }
-  //@}
-  
   /*! \name allocation_discard
-   * \brief Discards without saving any dirty pages in map and decommits any RAM storage used by the map.
-   * This essentially returns a map to a state of being freshly just mapped.
+   * \brief Discards without saving any dirty pages in the map and decommits any RAM caching used by the map.
+   * This essentially returns a map to a state of being freshly just mapped in terms of use of kernel resources.
+   * Note that the kernel is free to ignore or partially ignore this request, and may in fact incompletely
+   * decommit storage such that the discarded pages become a mix of zeroed and non-zeroed pages.
+   * 
+   * If you routinely allocate buffers, use them and deallocate them, this is *exactly* the correct alternative.
+   * Instead of deallocation, discard their contents instead and reuse the allocation.
    */
   //@{
   virtual size_type discard(map_t *m, size_type no) BOOST_NOEXCEPT=0;
   //! \brief Optimisation for a single map_t
-  bool discard(map_t &m) BOOST_NOEXCEPT { return 1==discard(&m 1); }
+  bool discard(map_t &m) BOOST_NOEXCEPT { return 1==discard(&m, 1); }
   //! \brief For a range of dereferenceable pointers or iterators
   template<class T, typename=typename detail::is_rangeable<T>::type> size_type discard(T &&begin, T &&end)
   {
@@ -200,40 +223,63 @@ public:
   //@}
 };
 
-/*! \class provider
- * \brief A provider of kernel memory
+/*! \class source
+ * \brief A source of kernel memory
+ * 
+ * Not only can one set a ceiling on the size of memory allocated, one can set a maximum total count
+ * which is very useful for out of memory testing.
  */
-class BOOST_KERNELALLOC_DECL provider : public std::enable_shared_from_this<provider>
+class BOOST_KERNELALLOC_DECL source : public std::enable_shared_from_this<source>
 {
 public:
+  //! \brief Rebinds a pointer to a different type of allocation
+  template<class T> using rebind_pointer = std::shared_ptr<T>;
   //! \brief A pointer to an allocation
-  typedef std::shared_ptr<allocation> pointer;
+  typedef rebind_pointer<allocation> pointer;
   //! \brief A const pointer to an allocation
   typedef const pointer const_pointer;
   //! \brief A size_t
   typedef size_t size_type;
+protected:
+  bool _using_remaining;
+  size_type _maximum;
+  atomic<size_type> _allocated, _remaining;
+  source(size_type maximum, size_type remaining) : _using_remaining((remaining!=(size_type)-1)), _maximum(maximum), _remaining(remaining) { }
   
-  //! \brief The name of this provider, suitable for printing etc.
+  void _register_map(allocation *a, allocation::map_t &map);
+  void _register_unmap(allocation *a, allocation::map_t &map);
+public:
+  
+  //! \brief The maximum amount of memory this source can allocate
+  size_type maximum() const BOOST_NOEXCEPT { return _maximum; }
+  
+  //! \brief The amount of memory currently allocated by this source
+  size_type allocated() const BOOST_NOEXCEPT { return _allocated; }
+  
+  //! \brief The amount of memory remaining which this source can allocate
+  size_type remaining() const BOOST_NOEXCEPT { return _remaining; }
+  
+  //! \brief The name of this source, suitable for printing etc.
   virtual const char *name() BOOST_NOEXCEPT=0;
   
-  /*! \brief Allocates at least \em bytes from the provider, returning an empty pointer if unsuccessful
+  /*! \brief Allocates at least \em bytes from the source, returning an empty pointer if unsuccessful
    */
   virtual pointer allocate(error_code &ec, size_type bytes) BOOST_NOEXCEPT=0;
   
   /*! \brief Returns the allocation associated with mapped address \em addr
    */
-  virtual pointer allocation(void *addr, allocation::map_t *map=nullptr) BOOST_NOEXCEPT=0;
+  pointer allocation(void *addr, allocation::map_t *map=nullptr) BOOST_NOEXCEPT;
 };
 
 /*! \class allocator
- * \brief A STL compatible allocator allocating memory from a provider
+ * \brief A STL compatible allocator allocating memory from a kernel source
  */
 template<class T> class allocator
 {
   template<class A, class B> friend inline bool operator==(const allocator<A> &a, const allocator<B> &b) BOOST_NOEXCEPT;
   template<class A, class B> friend inline bool operator!=(const allocator<A> &a, const allocator<B> &b) BOOST_NOEXCEPT;
   
-  std::shared_ptr<provider> _provider;
+  source_ptr _source;
 public:
   typedef T value_type;
   typedef T *pointer;
@@ -247,29 +293,31 @@ public:
   template<class U> struct rebind { typedef allocator<U> other; };
   
   allocator() BOOST_NOEXCEPT { }
-  allocator(const allocator &o) BOOST_NOEXCEPT : _provider(o._provider) { }
-  allocator(allocator &&o) BOOST_NOEXCEPT : _provider(std::move(o._provider)) { }
-  template<class U> allocator(const allocator<U> &o) BOOST_NOEXCEPT : _provider(o._provider) { }
-  template<class U> allocator(allocator<U> &&o) BOOST_NOEXCEPT : _provider(std::move(o._provider)) { }
+  allocator(source_ptr source) BOOST_NOEXCEPT : _source(source) { }
+  allocator(const allocator &o) BOOST_NOEXCEPT : _source(o._source) { }
+  allocator(allocator &&o) BOOST_NOEXCEPT : _source(std::move(o._source)) { }
+  template<class U> allocator(const allocator<U> &o) BOOST_NOEXCEPT : _source(o._source) { }
+  template<class U> allocator(allocator<U> &&o) BOOST_NOEXCEPT : _source(std::move(o._source)) { }
   pointer address(reference x) const BOOST_NOEXCEPT { return std::addressof(x); }
   const_pointer address(const_reference x) const BOOST_NOEXCEPT { return std::addressof(x); }
   pointer allocate(size_type n, std::allocator<void>::const_pointer hint=0)
   {
-    if(!_provider) throw std::invalid_argument("Unset provider");
+    if(!_source) throw std::invalid_argument("Unset source");
     if(n>max_size()) throw std::bad_alloc();
     error_code ec;
     size_type bytes=n*sizeof(T);
-    auto a(_provider->allocate(ec, bytes));
+    auto a(_source->allocate(ec, bytes));
     if(ec || !a) throw std::system_error(ec);
-    auto m(a->map());
+    // Probably he's just about to construct into this now, so prefault as a batch
+    auto m(a->map_prefault());
     if(!m->addr) throw std::bad_alloc();
     return static_cast<pointer>(m->addr);
   }
   void deallocate(pointer p, size_type n)
   {
-    if(!_provider) throw std::invalid_argument("Unset provider");
+    if(!_source) throw std::invalid_argument("Unset source");
     allocation::map_t m;
-    auto a(_provider->allocation(p, &m));
+    auto a(_source->allocation(p, &m));
     if(!a) throw std::invalid_argument("Address not found");
     a->unmap(m);
     if(m.ec) throw std::system_error(m.ec, "Failed to unmap allocation");
@@ -278,8 +326,53 @@ public:
   template<class U, class... Args> void construct(U *p, Args &&... args) { ::new(p) U(std::forward<Args>(args)...); }
   template<class U> void destroy(U *p) { p->~U(); }
 };
-template<class A, class B> inline bool operator==(const allocator<A> &a, const allocator<B> &b) BOOST_NOEXCEPT { return a._provider==b._provider; }
-template<class A, class B> inline bool operator!=(const allocator<A> &a, const allocator<B> &b) BOOST_NOEXCEPT { return a._provider!=b._provider; }
+template<class A, class B> inline bool operator==(const allocator<A> &a, const allocator<B> &b) BOOST_NOEXCEPT { return a._source==b._source; }
+template<class A, class B> inline bool operator!=(const allocator<A> &a, const allocator<B> &b) BOOST_NOEXCEPT { return a._source!=b._source; }
+
+
+/*! \class nonpersistent_allocation
+ * \brief An allocation of non persistent memory in the kernel.
+ * 
+ * This is generally the fastest kernel memory allocator. Limitations:
+ *  - Only the map of offset zero to length will succeed.
+ *  - Attempts to duplicate the map will return the existing map.
+ *  - Contents are destroyed as soon as unmap is called.
+ */
+class BOOST_KERNELALLOC_DECL nonpersistent_allocation : public allocation
+{
+protected:
+  allocation(nonpersistent_source *p, size_type bytes);
+public:
+  virtual ~nonpersistent_allocation() override final;
+  
+  virtual size_type map(map_t *m, size_type no) BOOST_NOEXCEPT override final;
+  virtual size_type map_prefault(map_t *m, size_type no) BOOST_NOEXCEPT override final;
+  virtual size_type unmap(map_t *m, size_type no) BOOST_NOEXCEPT override final;
+  virtual size_type discard(map_t *m, size_type no) BOOST_NOEXCEPT override final;
+};
+
+/*! \class nonpersistent_source
+ * \brief A non-persistent source of kernel memory, usually the system page file.
+ */
+class BOOST_KERNELALLOC_DECL nonpersistent_source : public source
+{
+public:
+  //! \brief A pointer to an allocation
+  typedef rebind_pointer<nonpersistent_allocation> pointer;
+  //! \brief A const pointer to an allocation
+  typedef const pointer const_pointer;
+
+  //! \brief Constructs a source of non persistent kernel memory.
+  nonpersistent_source(size_type maximum=(size_type)-1, size_type remaining=(size_type)-1) : source(maximum, remaining) { }
+  
+  //! \brief The name of this source, suitable for printing etc.
+  virtual const char *name() BOOST_NOEXCEPT override final { return "non-persistent"; }
+  
+  /*! \brief Allocates at least \em bytes from the source, returning an empty pointer if unsuccessful
+   */
+  virtual pointer allocate(error_code &ec, size_type bytes) BOOST_NOEXCEPT override final;
+};
+
 
 BOOST_KERNELALLOC_V1_NAMESPACE_END
 
