@@ -1,6 +1,6 @@
-/* kernelalloc.hpp
+/* kernel_alloc.hpp
 Provides a kernel memory allocator and manager
-(C) 2014 Niall Douglas http://www.nedprod.com/
+(C) 2014 MaidSafe Ltd.
 File Created: Nov 2014
 
 
@@ -33,7 +33,7 @@ DEALINGS IN THE SOFTWARE.
 
 #ifdef BOOST_KERNELALLOC_NEED_DEFINE
 
-/*! \file kernelalloc.hpp
+/*! \file kernel_alloc.hpp
  * \brief Defines the functionality provided by Boost.KernelAlloc
  */
 
@@ -56,6 +56,9 @@ typedef std::shared_ptr<source> source_ptr;
  * for subsequent allocations. Therefore if the allocation is particularly large, you might
  * consider setting the discard_on_free flag which will release any RAM resources on free or
  * even the destroy_on_free flag which will release all storage on free.
+ *
+ * Mapping an allocation takes a shared_ptr to the allocation, thus pinning it from being
+ * destructed until the last map is unmapped.
  */
 class BOOST_KERNELALLOC_DECL allocation : public std::enable_shared_from_this<allocation>
 {
@@ -90,6 +93,9 @@ public:
   
   //! \brief The size of the allocation
   size_type size() const BOOST_NOEXCEPT { return _size; }
+  
+  //! \brief The maps of this allocation into the current process
+  std::vector<map_t> maps() const BOOST_NOEXCEPT;
   
   /*! \name allocation_map
    * \brief Maps part of the allocation into the calling process. \em offset and \em length need to be valid.
@@ -317,68 +323,10 @@ public:
    */
   virtual expected<pointer, error_code> allocate(size_type bytes) BOOST_NOEXCEPT=0;
   
-  /*! \brief Returns the allocation associated with mapped address \em addr
+  /*! \brief Returns the source and allocation associated with mapped address \em addr
    */
-  std::pair<pointer, allocation::map_t> map_to_pointer(void *addr) BOOST_NOEXCEPT;
+  static std::tuple<source_ptr, pointer, allocation::map_t> locate_addr(void *addr) BOOST_NOEXCEPT;
 };
-
-/*! \class allocator
- * \brief A STL compatible allocator allocating memory from a kernel source
- */
-template<class T> class allocator
-{
-  template<class A, class B> friend inline bool operator==(const allocator<A> &a, const allocator<B> &b) BOOST_NOEXCEPT;
-  template<class A, class B> friend inline bool operator!=(const allocator<A> &a, const allocator<B> &b) BOOST_NOEXCEPT;
-  
-  source_ptr _source;
-public:
-  typedef T value_type;
-  typedef T *pointer;
-  typedef const pointer const_pointer;
-  typedef T &reference;
-  typedef const reference const_reference;
-  typedef size_t size_type;
-  typedef ptrdiff_t difference_type;
-  typedef std::true_type propagate_on_container_move_assignment;
-  typedef std::false_type is_always_equal;
-  template<class U> struct rebind { typedef allocator<U> other; };
-  
-  allocator() BOOST_NOEXCEPT { }
-  allocator(source_ptr source) BOOST_NOEXCEPT : _source(source) { }
-  allocator(const allocator &o) BOOST_NOEXCEPT : _source(o._source) { }
-  allocator(allocator &&o) BOOST_NOEXCEPT : _source(std::move(o._source)) { }
-  template<class U> allocator(const allocator<U> &o) BOOST_NOEXCEPT : _source(o._source) { }
-  template<class U> allocator(allocator<U> &&o) BOOST_NOEXCEPT : _source(std::move(o._source)) { }
-  pointer address(reference x) const BOOST_NOEXCEPT { return std::addressof(x); }
-  const_pointer address(const_reference x) const BOOST_NOEXCEPT { return std::addressof(x); }
-  pointer allocate(size_type n, std::allocator<void>::const_pointer hint=0)
-  {
-    if(!_source) throw std::invalid_argument("Unset source");
-    if(n>max_size()) throw std::bad_alloc();
-    size_type bytes=n*sizeof(T);
-    auto a(_source->allocate(bytes));
-    if(!a) throw std::system_error(a.error());
-    // Probably he's just about to construct into this now, so prefault as a batch
-    auto m(a->map_prefault());
-    if(!m->addr) throw std::bad_alloc();
-    return static_cast<pointer>(m->addr);
-  }
-  void deallocate(pointer p, size_type n)
-  {
-    if(!_source) throw std::invalid_argument("Unset source");
-    allocation::map_t m;
-    auto a(_source->allocation(p, &m));
-    if(!a) throw std::invalid_argument("Address not found");
-    a->unmap(m);
-    if(m.ec) throw std::system_error(m.ec, "Failed to unmap allocation");
-  }
-  size_type max_size() const BOOST_NOEXCEPT { return ((size_type)-1)/sizeof(T); }
-  template<class U, class... Args> void construct(U *p, Args &&... args) { ::new(p) U(std::forward<Args>(args)...); }
-  template<class U> void destroy(U *p) { p->~U(); }
-};
-template<class A, class B> inline bool operator==(const allocator<A> &a, const allocator<B> &b) BOOST_NOEXCEPT { return a._source==b._source; }
-template<class A, class B> inline bool operator!=(const allocator<A> &a, const allocator<B> &b) BOOST_NOEXCEPT { return a._source!=b._source; }
-
 
 /*! \class nonpersistent_allocation
  * \brief An allocation of non persistent memory in the kernel.
@@ -536,14 +484,14 @@ public:
 };
 
 
-/*! \class durable_allocation
- * \brief An allocation of durable memory in the kernel backed by a file on the filing system.
+/*! \class file_allocation
+ * \brief An allocation of memory in the kernel backed by a file on the filing system.
  * 
- * Durable allocations are similar to persistent allocations, except that their storage is kept
+ * File allocations are similar to persistent allocations, except that their storage is kept
  * in a sparse file on the filing system and therefore will "survive" reboots (see below). The
  * intent of their usage is for very large allocations which would normally be refused to be backed
  * by the system page file, so if you need to allocate multiple gigabytes of memory far exceeding
- * available RAM, durable_source is exactly the right thing to use. You should note:
+ * available RAM, file_source is exactly the right thing to use. You should note:
  * 
  *  - Dirty pages are kept in memory as much as possible, and only actually flushed to the disk
  *    when there is insufficient RAM to store their contents anywhere else. By default the
@@ -566,16 +514,16 @@ public:
  * 
  *  - If you do persist allocations, you will need to retain their unique id and size across reboots.
  */
-class BOOST_KERNELALLOC_DECL persistent_allocation : public allocation
+class BOOST_KERNELALLOC_DECL file_allocation : public allocation
 {
 public:
   //! \brief The type of a unique allocation id
   typedef unsigned long long unique_id_t;
 protected:
   unique_id_t _unique_id;
-  persistent_allocation(nonpersistent_source *p, size_type bytes);
+  file_allocation(nonpersistent_source *p, size_type bytes);
 public:
-  virtual ~persistent_allocation() override final;
+  virtual ~file_allocation() override final;
   
   virtual size_type map(map_t *m, size_type no) BOOST_NOEXCEPT override final;
   virtual size_type map_prefault(map_t *m, size_type no) BOOST_NOEXCEPT override final;
@@ -590,33 +538,111 @@ public:
   error_code resize(size_type newsize) BOOST_NOEXCEPT;
 };
 
-/*! \class durable_source
- * \brief A durable source of kernel memory stored in a file on the filing system.
+/*! \class file_source
+ * \brief A source of kernel memory stored in a file on the filing system.
  */
-class BOOST_KERNELALLOC_DECL durable_source : public source
+class BOOST_KERNELALLOC_DECL file_source : public source
 {
 public:
   //! \brief A pointer to an allocation
-  typedef rebind_pointer<durable_allocation> pointer;
+  typedef rebind_pointer<file_allocation> pointer;
   //! \brief A const pointer to an allocation
   typedef const pointer const_pointer;
+  //! \brief A native handle type
+#ifdef WIN32
+  typedef void *native_handle_type;
+#else
+  typedef int native_handle_type;
+#endif
   
-  //! \brief Constructs a source of durable kernel memory.
-  persistent_source(path name, flags_t flags=flags_t::normal, size_type maximum=(size_type)-1, size_type remaining=(size_type)-1) : source(maximum, remaining) { }
+  //! \brief Constructs a file source of kernel memory.
+  file_source(path name, flags_t flags=flags_t::normal, size_type maximum=(size_type)-1, size_type remaining=(size_type)-1) : source(maximum, remaining) { }
+  
+  //! \brief Adopts a file source of kernel memory.
+  file_source(native_handle_type handle, flags_t flags=flags_t::normal, size_type maximum=(size_type)-1, size_type remaining=(size_type)-1) : source(maximum, remaining) { }
   
   //! \brief The name of this source, suitable for printing etc.
-  virtual const char *name() BOOST_NOEXCEPT override final { return "durable"; }
+  virtual const char *name() BOOST_NOEXCEPT override final { return "file"; }
   
   /*! \brief Allocates at least \em bytes from the source, returning an empty pointer if unsuccessful
    */
   virtual expected<pointer, error_code> allocate(size_type bytes) BOOST_NOEXCEPT override final;
 
+  //! \brief The native handle of the file backing this source
+  native_handle_type native_handle() const BOOST_NOEXCEPT;
+  
   /*! \brief Returns the allocation associated with unique id \em id
    */
   std::pair<pointer, allocation::map_t> id_to_pointer(persistent_allocation::unique_id_t id, size_type size) BOOST_NOEXCEPT;
 
 };
 
+
+/*! \class allocator
+ * \brief A STL compatible allocator allocating memory from a kernel source
+ */
+template<class T> class allocator
+{
+  template<class A, class B> friend inline bool operator==(const allocator<A> &a, const allocator<B> &b) BOOST_NOEXCEPT;
+  template<class A, class B> friend inline bool operator!=(const allocator<A> &a, const allocator<B> &b) BOOST_NOEXCEPT;
+  
+  source_ptr _source;
+public:
+  typedef T value_type;
+  typedef T *pointer;
+  typedef const pointer const_pointer;
+  typedef T &reference;
+  typedef const reference const_reference;
+  typedef size_t size_type;
+  typedef ptrdiff_t difference_type;
+  typedef std::true_type propagate_on_container_move_assignment;
+  typedef std::false_type is_always_equal;
+  template<class U> struct rebind { typedef allocator<U> other; };
+  
+  allocator() BOOST_NOEXCEPT { }
+  allocator(source_ptr source) BOOST_NOEXCEPT : _source(source) { }
+  allocator(const allocator &o) BOOST_NOEXCEPT : _source(o._source) { }
+  allocator(allocator &&o) BOOST_NOEXCEPT : _source(std::move(o._source)) { }
+  template<class U> allocator(const allocator<U> &o) BOOST_NOEXCEPT : _source(o._source) { }
+  template<class U> allocator(allocator<U> &&o) BOOST_NOEXCEPT : _source(std::move(o._source)) { }
+  pointer address(reference x) const BOOST_NOEXCEPT { return std::addressof(x); }
+  const_pointer address(const_reference x) const BOOST_NOEXCEPT { return std::addressof(x); }
+  pointer allocate(size_type n, std::allocator<void>::const_pointer hint=0)
+  {
+    if(!_source) throw std::invalid_argument("Unset source");
+    if(n>max_size()) throw std::bad_alloc();
+    size_type bytes=n*sizeof(T);
+    auto a(_source->allocate(bytes));
+    if(!a) throw std::system_error(a.error());
+    // Probably he's just about to construct into this now, so prefault as a batch
+    auto m(a->map_prefault());
+    if(!m->addr) throw std::bad_alloc();
+    return static_cast<pointer>(m->addr);
+  }
+  // Must accept any pointer from any source equally (STL requirements)
+  void deallocate(pointer p, size_type n)
+  {
+    source_ptr source_;
+    typename source::pointer allocation_;
+    allocation::map_t map_;
+    std::tie(source_, allocation_, map_)=source::locate_addr(p);
+    if(!allocation_) throw std::invalid_argument("Address not found");
+    allocation_->unmap(map_);
+    if(map_.ec) throw std::system_error(m.ec, "Failed to unmap allocation");
+  }
+  size_type max_size() const BOOST_NOEXCEPT { return ((size_type)-1)/sizeof(T); }
+  template<class U, class... Args> void construct(U *p, Args &&... args) { ::new(p) U(std::forward<Args>(args)...); }
+  template<class U> void destroy(U *p) { p->~U(); }
+};
+template<class A, class B> inline bool operator==(const allocator<A> &a, const allocator<B> &b) BOOST_NOEXCEPT { return a._source==b._source; }
+template<class A, class B> inline bool operator!=(const allocator<A> &a, const allocator<B> &b) BOOST_NOEXCEPT { return a._source!=b._source; }
+
+
+// TODO: Free functions async_send() and async_receive() for sequences of allocation
+
+// TODO: Free functions need to static_assert for trivial destructor of buffer type
+
+// TODO: Free functions for gather hashing and gather decrypt
 
 BOOST_KERNELALLOC_V1_NAMESPACE_END
 
