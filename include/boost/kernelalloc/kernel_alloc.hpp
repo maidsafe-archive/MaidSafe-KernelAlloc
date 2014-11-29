@@ -42,7 +42,7 @@ BOOST_KERNELALLOC_V1_NAMESPACE_BEGIN
 namespace detail
 {
   template<class T, typename = decltype(*std::declval<T&>(), ++std::declval<T&>(), void())> struct is_rangeable { typedef T type; };
-  template<class T, typename = decltype(*std::begin(std::declval<T>()), *std::end(std::declval<T>()), void())> struct is_container { typedef T type; };
+  template<class T, typename = decltype(*std::begin(std::declval<T>()), *std::end(std::declval<T>()), void())> struct is_container { typedef decltype(*std::begin(std::declval<T>())) type; };
 }
 
 class source;
@@ -82,7 +82,7 @@ public:
 private:
   source *_source;
 protected:
-  size_type _size;
+  size_type _size, _actualsize;
   allocation(source *p, size_type size) : _source(p), _size(size) { }
 public:
   virtual ~allocation() {}
@@ -94,8 +94,27 @@ public:
   //! \brief The size of the allocation
   size_type size() const BOOST_NOEXCEPT { return _size; }
   
+  //! \brief The actual size of the allocation, you can resize to this without relocation.
+  size_type actual_size() const BOOST_NOEXCEPT { return _actualsize; }
+  
   //! \brief The maps of this allocation into the current process
   std::vector<map_t> maps() const BOOST_NOEXCEPT;
+  
+  //! \brief Tries to resize the allocation to \em newsize without relocation (and therefore maps are not disturbed), returning true if successful.
+  virtual bool try_resize(size_type newsize) BOOST_NOEXCEPT
+  {
+    if(newsize<=_actualsize)
+    {
+      _size=newsize;
+      return true;
+    }
+    return false;
+  }
+
+  /*! \brief Tries to resize the allocation to \em newsize with address relocation (and
+  therefore no maps can exist). For most sources this is a zero memory copy operation.
+  */
+  virtual error_code resize(size_type newsize) BOOST_NOEXCEPT=0;
   
   /*! \name allocation_map
    * \brief Maps part of the allocation into the calling process. \em offset and \em length need to be valid.
@@ -275,6 +294,13 @@ public:
  * 
  * Not only can one set a ceiling on the size of memory allocated, one can set a maximum total count
  * which is very useful for out of memory testing.
+ *
+ * Note that a source is intended as a single scatter gather DMA operation. You should therefore
+ * allocate a source per scatter and per gather. The allocations from each source are equivalent
+ * to individual buffers in a gather/scatter operation.
+ *
+ * Underlying resources behind a source are usually reset to default storage on destruction instead
+ * of being actually destroyed, and kept on a ring buffer for fast construction.
  */
 class BOOST_KERNELALLOC_DECL source : public std::enable_shared_from_this<source>
 {
@@ -323,6 +349,10 @@ public:
    */
   virtual expected<pointer, error_code> allocate(size_type bytes) BOOST_NOEXCEPT=0;
   
+  /*! \brief Allocates a set of different sized allocations from the source in a single go.
+   */
+  virtual expected<std::vector<pointer>, error_code> allocate(size_type no, size_type *bytes) BOOST_NOEXCEPT=0;
+  
   /*! \brief Returns the source and allocation associated with mapped address \em addr
    */
   static std::tuple<source_ptr, pointer, allocation::map_t> locate_addr(void *addr) BOOST_NOEXCEPT;
@@ -331,7 +361,9 @@ public:
 /*! \class nonpersistent_allocation
  * \brief An allocation of non persistent memory in the kernel.
  * 
- * This is generally the fastest kernel memory allocator. Limitations:
+ * This is generally the fastest kernel memory allocator, but comes with significant limitations:
+ *  - All allocations are aligned to a page size boundary and are rounded up to page size multiples.
+ *  - Cannot resize allocations except on Linux.
  *  - Only the map of offset zero to length will succeed.
  *  - Attempts to duplicate the map will return the existing map.
  *  - Contents are destroyed as soon as unmap is called.
@@ -423,12 +455,17 @@ public:
  * Unlike non persistent allocations, storage for persistent allocations is kept in the
  * temporary file system cache or equivalent. It therefore can persist until the next reboot
  * of the machine, and it offers the following features:
+ *  - Allocations are aligned to the cache line boundary and are of cache line sized multiples.
+ *    This is ideal for the DMA engine, whilst not wasting too much space for small allocations.
  *  - Maps of any part of the allocation into user space can be made, including duplicate maps and
  *    discontinuous maps.
  *  - Contents survive no maps existing, though remember to keep a shared_ptr open to the allocation
  *    if you wish its contents to be retained.
+ *  - Resizing works as expected, and zero copy allocation expansion can be achieved by keeping allocation
+ *    sizes to page size boundaries as additional storage is mapped in as page extensions during maps.
  *  - Persistent allocation sources can be named, and that name also used by other processes to see the same
- *    allocation. Simply ask the same named source for the allocation with the given unique id.
+ *    allocation. Simply ask the same named source for the allocation with the given unique id. Note you
+ *    cannot resize an allocation shared with other processes.
  *  - Lets 32 bit processes use a lot more RAM than 4Gb. One must simply take care to not leave
  *    allocations mapped into memory lying around.
  */
@@ -453,7 +490,7 @@ public:
   unique_id_t unique_id() const BOOST_NOEXCEPT { return _unique_id; }
 
   //! \brief Resizes the allocation to a new size
-  error_code resize(size_type newsize) BOOST_NOEXCEPT;
+  virtual error_code resize(size_type newsize) BOOST_NOEXCEPT override final;
 };
 
 /*! \class persistent_source
@@ -495,7 +532,7 @@ public:
  * 
  *  - Dirty pages are kept in memory as much as possible, and only actually flushed to the disk
  *    when there is insufficient RAM to store their contents anywhere else. By default the
- *    destroy_on_free flag is set in durable_source, this will throw away any dirty pages instead of
+ *    destroy_on_free flag is set in file_source, this will throw away any dirty pages instead of
  *    writing anything out on free and also deallocate any of that allocation which was flushed to
  *    disk, so ordinarily speaking the backing file consumes a minimal amount of disk space (see below)
  *    despite declaring itself to be many gigabytes in size. If you want to actually persist an
@@ -513,6 +550,7 @@ public:
  *    generally always recommended, just be careful of races with any other concurrent users.
  * 
  *  - If you do persist allocations, you will need to retain their unique id and size across reboots.
+ *    Again, you cannot resize an allocation if you wish to persist it across reboots.
  */
 class BOOST_KERNELALLOC_DECL file_allocation : public allocation
 {
@@ -556,10 +594,10 @@ public:
 #endif
   
   //! \brief Constructs a file source of kernel memory.
-  file_source(path name, flags_t flags=flags_t::normal, size_type maximum=(size_type)-1, size_type remaining=(size_type)-1) : source(maximum, remaining) { }
+  file_source(path name, flags_t flags=flags_t::destroy_on_free, size_type maximum=(size_type)-1, size_type remaining=(size_type)-1) : source(maximum, remaining) { }
   
-  //! \brief Adopts a file source of kernel memory.
-  file_source(native_handle_type handle, flags_t flags=flags_t::normal, size_type maximum=(size_type)-1, size_type remaining=(size_type)-1) : source(maximum, remaining) { }
+  //! \brief Adopts a file source of kernel memory from an existing native file handle.
+  file_source(native_handle_type handle, flags_t flags=flags_t::destroy_on_free, size_type maximum=(size_type)-1, size_type remaining=(size_type)-1) : source(maximum, remaining) { }
   
   //! \brief The name of this source, suitable for printing etc.
   virtual const char *name() BOOST_NOEXCEPT override final { return "file"; }
@@ -570,6 +608,9 @@ public:
 
   //! \brief The native handle of the file backing this source
   native_handle_type native_handle() const BOOST_NOEXCEPT;
+  
+  //! \brief Detaches the native handle of the file backing this source from this source. The handle will no longer be used or closed on destruction.
+  native_handle_type detach() BOOST_NOEXCEPT;
   
   /*! \brief Returns the allocation associated with unique id \em id
    */
@@ -640,9 +681,36 @@ template<class A, class B> inline bool operator!=(const allocator<A> &a, const a
 
 // TODO: Free functions async_send() and async_receive() for sequences of allocation
 
-// TODO: Free functions need to static_assert for trivial destructor of buffer type
+// TODO: Free functions need to static_assert for trivial destructor of buffer type to
+//       prevent write after send.
+
+template<class Buffers, class CompletionToken, typename = typename
+    std::enable_if<
+      std::is_constructible<
+        allocation,
+        typename detail::is_container<Buffers>::type
+      >::value
+    >::type>
+  typename asio::async_result<asio::handler_type_t<CompletionToken>, void(error_code, size_t)>>::type
+  async_receive(Buffers n, CompletionToken &&token)
+{
+  
+}
 
 // TODO: Free functions for gather hashing and gather decrypt
+
+template<class Buffers, class CompletionToken, typename = typename
+    std::enable_if<
+      std::is_constructible<
+        allocation,
+        typename detail::is_container<Buffers>::type
+      >::value
+    >::type>
+  typename asio::async_result<asio::handler_type_t<CompletionToken>, void(error_code, size_t)>>::type
+  async_aes128_read(Buffers n, CompletionToken &&token)
+{
+  
+}
 
 BOOST_KERNELALLOC_V1_NAMESPACE_END
 
